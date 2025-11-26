@@ -46,9 +46,13 @@ The **treasury_pda** is created using the following two seeds `["treasur", publi
 
 ### Program Instructions
 **Instructions Implemented:**
-- **Initialize**: Creates a new counter account for the user with initial value of 0
-- **Increment**: Increases the counter value by 1 and tracks total increments
-- **Reset**: Sets the counter value back to 0 while preserving the owner information
+- **transfer_hook**: To take a 1% fee in Wrapped SOL (WSOL) on every token transfer.
+- **initialize_extra_account_meta_list**: Setup instruction that must be called once for each token mint that will use the transfer hook to create and initialize an on-chain account (extra_account_meta_list) that stores the list of all additional accounts required by the transfer_hook instruction. The Token-2022 program reads this list to know which accounts to pass into your hook.
+- **update_extra_account_meta_list**: To update the on-chain list of accounts required by the transfer_hook. This is useful if the hook's logic changes and requires different or additional accounts
+- **initialize_treasury**: One-time setup instruction used to create the account that will collect the fees, to create the program-controlled token account (treasury_pda) that will receive and store the transfer fees.
+- **withdraw**: It first checks if the transaction signer's key matches the ADMIN_AUTHORITY. If not, it returns an Unauthorized error.
+It then performs a CPI to the token program to transfer the specified amount from the treasury_pda to a destination_account.
+The treasury_pda signs for this transfer using its seeds, proving that the program is authorizing the withdrawal.
 
 ### Account Structure
 ```rust
