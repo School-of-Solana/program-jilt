@@ -101,18 +101,51 @@ pub struct InitializeTreasury<'info> {
 ## Testing
 
 ### Test Coverage
-Comprehensive test suite covering all instructions with both successful operations and error conditions to ensure program security and reliability.
+test suite written using the Anchor framework, which uses Mocha and Chai for its testing structure and assertions. Its purpose is to simulate interactions with your smart contract in a local, controlled environment to verify that every part of it works as expected.
+Tested actions are:
+1. Create Mints: It creates a brand new Token-2022 mint (hookedTokenMint) that will be used for the taxed transfers. It also defines the feeTokenMint as the public key for Wrapped SOL.
+2. Find PDAs: It uses PublicKey.findProgramAddressSync to calculate the addresses for the extra-account-metas PDA and the treasury PDA. This is done before they are created on-chain.
+3. Create ATAs: It creates all the necessary Associated Token Accounts (ATAs) for the admin and recipient to hold the new hookedTokenMint and for the admin to hold the feeTokenMint (for the final withdrawal).
+4. Mint Tokens: It mints a starting balance of the hookedTokenMint to the admin's ATA, so the admin has funds to use in the transfer test.
 
 **Happy Path Tests:**
-- **Initialize Counter**: Successfully creates a new counter account with correct initial values
-- **Increment Counter**: Properly increases count and total_increments by 1
-- **Reset Counter**: Sets count to 0 while preserving owner and total_increments
+- **Initialize**:
+1. Action: It calls the initializeExtraAccountMetaList and initializeTreasury methods on your program. This sends transactions to the local validator to create and initialize the two required PDAs.
+2. Verification: After the instructions are executed, it fetches the treasuryPda account from the local chain. It then uses expect (from the Chai assertion library) to verify two critical things:
+   - expect(treasuryAccount.owner.equals(admin.publicKey)).to.be.false;: It confirms the treasury account is not owned by the admin, but by the Token Program. This is correct, as it's a token account.
+   - expect(treasuryAccount.mint.equals(feeTokenMint)).to.be.true;: It confirms the treasury account is for the correct mint (wSOL).
 
+- **The Hooked Transfer**: Simulates a token transfer that should trigger the fee-taking hook and verifies that the balances change correctly.
+1. Setup: It first records the starting balances of the admin's token account, the recipient's token account, and the treasury.
+2. Action:
+It builds a standard getTransferCheckedInstruction.
+Crucially, it manually adds the extra accounts required by the transfer hook to the instruction's keys array. This is what tells the Solana runtime to invoke your hook program during the transfer.
+It sends this modified instruction in a transaction.
+3. Verification: After the transfer is confirmed, it fetches the final balances and makes three precise assertions:
+   - It checks that the admin's balance has decreased by the TRANSFER_AMOUNT plus the calculated feeAmount.
+   - It checks that the recipient's balance has increased by exactly the TRANSFER_AMOUNT.
+   - It checks that the treasury's balance has increased by exactly the feeAmount.
+- **Withdrawing Fees**: This final test ensures that the admin can successfully withdraw the fees that have been collected in the treasury.
+1. Setup: It gets the current balance of the treasury (which we know contains fees from the previous test) and the admin's wSOL account.
+2. Action: It calls the withdraw method on your program, telling it to withdraw the entire balance of the treasury to the admin's fee ATA.
+3. Verification: It fetches the final balances and asserts two things:
+   - The treasury's balance is now zero.
+   - The admin's wSOL account balance has increased by the amount that was in the treasury.
+     
 **Unhappy Path Tests:**
-- **Initialize Duplicate**: Fails when trying to initialize a counter that already exists
-- **Increment Unauthorized**: Fails when non-owner tries to increment someone else's counter
-- **Reset Unauthorized**: Fails when non-owner tries to reset someone else's counter
-- **Account Not Found**: Fails when trying to operate on non-existent counter
+- **Fails to withdraw from the treasury for a non-authority**: Ensures that only the designated authority (the admin) can withdraw funds from the fee treasury. It's a critical security check to prevent theft of funds.
+1. It first ensures the treasury has funds by performing another transfer.
+2. It creates a new, random keypair (randomUser).
+3. It attempts to call the withdraw instruction, but it tries to sign the transaction with randomUser instead of the admin.
+4. The test is wrapped in a try...catch block. It expects the transaction to fail.
+5. The catch block verifies that the error is a "Signature verification failed" error, which is what Solana returns when an instruction requires a signature from an account (admin.publicKey) that wasn't provided by a signer in the transaction (randomUser).
+6. If the transaction succeeds for any reason, expect.fail() is called, immediately failing the test.
+- **Fails a transfer if the sender cannot cover the fee**: Verifies that the Token-2022 program correctly enforces the transfer hook. If a mint is configured with a hook, the program will not allow any transfers unless the required extra accounts for that hook are provided in the instruction.
+1. It constructs a standard getTransferCheckedInstruction, just like in the successful transfer test.
+2. However, it intentionally omits adding the extraMetasPda and hookProgram accounts to the instruction.
+3. It then attempts to send this incomplete transaction.
+4. The test expects this transaction to fail. The Solana runtime and Token-2022 program should see that the mint requires a hook but that the necessary accounts are missing.
+5. The catch block asserts that the error message contains 0x40, which is the hexadecimal error code for IncorrectAccount in the Token-2022 program. This confirms the program is correctly blocking transfers that don't adhere to the hook's requirements.
 
 ### Running Tests
 ```bash
