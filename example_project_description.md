@@ -7,13 +7,18 @@
 ## Project Overview
 
 ### Description
-A simple decentralized counter application built on Solana. Users can create personal counters, increment them, and reset them to zero. Each user has their own counter account derived from their wallet address, ensuring data isolation and ownership. This dApp demonstrates basic Solana program development concepts including PDAs, account creation, and state management.
+This program implements a transfer hook for the SPL Token-2022 standard. A transfer hook is a powerful feature that allows a program to execute custom logic every time a specific token is transferred.
+
+In simple terms, this program is designed to take a 1% fee on every transfer of a Token-2022 token that has this hook enabled.
 
 ### Key Features
-- **Create Counter**: Initialize a new counter account for your wallet
-- **Increment Counter**: Add 1 to your personal counter value
-- **Reset Counter**: Set your counter back to 0
-- **View Counter**: Display current counter value and owner information
+**Transfer_hook function**: This is the core logic of the program. It's not called directly by users but is automatically invoked by the Token-2022 program during a transfer. It calculates a fee equal to 1% of the amount being transferred.
+It then transfers this fee amount in Wrapped SOL (WSOL) from the sender's WSOL account to a special treasury account (treasury_pda) controlled by the program.
+This fee transfer is authorized by a Program Derived Address (PDA), delegate_pda, which means the user must have pre-approved this PDA to spend their WSOL.
+**Initialize_treasury function**: This is a setup function to create the PDA (treasury_pda) that will collect the fees. It creates it as a token account for a specific mint. Based on the hook's logic, this would be used to create the treasury for WSOL.
+**Initialize_extra_account_meta_list & update_extra_account_meta_list functions**: The Token-2022 transfer hook standard requires that all extra accounts needed by the hook logic must be pre-registered in a special on-chain account (ExtraAccountMetaList).
+
+These functions create and manage this list. The list tells the Solana runtime which additional accounts (like the treasury, the sender's WSOL account, etc.) to load and provide to your transfer_hook function when it's called.
 
 ### How to Use the dApp
 1. **Connect Wallet** - Connect your Solana wallet
@@ -23,13 +28,21 @@ A simple decentralized counter application built on Solana. Users can create per
 5. **View Stats** - See your current count and total increments made
 
 ## Program Architecture
-The Counter dApp uses a simple architecture with one main account type and three core instructions. The program leverages PDAs to create unique counter accounts for each user, ensuring data isolation and preventing conflicts between different users' counters.
+I created a tax mechanism for a custom token. When someone transfers Token A, my program automatically takes a 1% fee in WSOL from their wallet.
 
 ### PDA Usage
-The program uses Program Derived Addresses to create deterministic counter accounts for each user.
+**Derivation**: The Solana runtime takes the seeds ("treasury" and the mint's public key) and the program's ID and uses them to generate a unique public key. This is the address of your treasury_pda.
+
+**Initialization**: The initialize_treasury function is responsible for actually creating the account on-chain, it:
+
+- Calculates the PDA using the seeds mentioned above.
+- Creates a new token account at that derived address.
+- Sets the owner of this new token account to be the PDA itself, ensuring only the program can control it.
+  
+Usage: Later, when the transfer_hook is executed, it uses the exact same seeds ("treasury" and the mint's public key) to find the treasury account that was created earlier. This allows it to transfer the 1% fee into the correct account.
 
 **PDAs Used:**
-- **Counter PDA**: Derived from seeds `["counter", user_wallet_pubkey]` - ensures each user has a unique counter account that only they can modify
+The **treasury_pda** is created using the following two seeds `["treasur", public key of the mint account for which the treasury is being created]`
 
 ### Program Instructions
 **Instructions Implemented:**
@@ -39,12 +52,29 @@ The program uses Program Derived Addresses to create deterministic counter accou
 
 ### Account Structure
 ```rust
-#[account]
-pub struct Counter {
-    pub owner: Pubkey,        // The wallet that owns this counter
-    pub count: u64,           // Current counter value
-    pub total_increments: u64, // Total number of times incremented (persists through resets)
-    pub created_at: i64,      // Unix timestamp when counter was created
+    #[account(
+        seeds = [b"my-treasury", wsol_mint.key().as_ref()], 
+        bump
+    )]
+    pub treasury_pda: InterfaceAccount<'info, TokenAccount>,
+```
+
+```rust
+    #[derive(Accounts)]
+pub struct InitializeTreasury<'info> {
+    #[account(mut)]
+    payer: Signer<'info>,
+
+    /// CHECK: ExtraAccountMetaList Account, must use these seeds
+    #[account(
+        mut,
+        seeds = [b"my-treasury", mint.key().as_ref()], 
+        bump
+    )]
+    pub treasury_pda: AccountInfo<'info>, // <-- Declaration for initialization
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 ```
 
