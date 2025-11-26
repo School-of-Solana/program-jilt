@@ -1,18 +1,33 @@
+#[cfg(not(feature = "no-entrypoint"))]
+use solana_security_txt::security_txt;
+
+#[cfg(not(feature = "no-entrypoint"))]
+security_txt! {
+    name: "Transfer Hook Example",
+    project_url: "http://solana.com",
+    contacts: "email:example@solana.com",
+    policy: "https://github.com/solana-labs/solana/blob/master/SECURITY.md"
+}
 use std::cell::RefMut;
 
-use anchor_lang::{
-    prelude::*,
-};
+use anchor_lang::prelude::*;
+use solana_program::{pubkey, pubkey::Pubkey};
 use anchor_spl::{
-    associated_token::AssociatedToken, token::{spl_token::{self, native_mint}, Token}, token_2022::{spl_token_2022::{self, extension::{transfer_hook::TransferHookAccount, BaseStateWithExtensionsMut, PodStateWithExtensionsMut}, pod::PodAccount}, Token2022}, token_interface::{Mint, TokenAccount, TokenInterface}
+    associated_token::AssociatedToken, token::{spl_token::{self, native_mint}, Token}, token_interface::{Mint, TokenAccount, TokenInterface}
 };
+use spl_pod::bytemuck::PodAccount;
+use spl_token_2022::{extension::{StateWithExtensionsMut}, state::Account as SplTokenAccount};
+use spl_token_2022_interface::extension::transfer_hook::TransferHookAccount;
 use spl_transfer_hook_interface::instruction::ExecuteInstruction;
 use spl_discriminator::SplDiscriminate;
-use spl_tlv_account_resolution::{account::ExtraAccountMeta, pubkey_data::PubkeyData, seeds::Seed, state::ExtraAccountMetaList};
+use spl_tlv_account_resolution::{account::ExtraAccountMeta, seeds::Seed, state::ExtraAccountMetaList};
 
 
 declare_id!("hoo9kSHtfFY6PLUoqEkHcZQJpTQvDYBi16GNXji8Z98");
 
+// Define the public key that is authorized to withdraw funds from the treasury.
+// Replace this with your actual admin wallet address.
+const ADMIN_AUTHORITY: Pubkey = pubkey!("CptnNxRJp2adjccrLA3P1UvFVpPsZ3HRU9Uui7egGRDJ");
 
 #[program]
 pub mod transfer_hook {
@@ -22,7 +37,7 @@ pub mod transfer_hook {
     
     use super::*;
 
-    #[instruction(discriminator = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE)]
+    // This is the instruction that's invoked by the token-2022 program
     pub fn transfer_hook(ctx: Context<TransferHook>, amount: u64) -> Result<()> {
 
         msg!("Transfer Hook called!");
@@ -49,9 +64,7 @@ pub mod transfer_hook {
         Ok(())
     }
 
-
-    
-    #[instruction(discriminator = [1])]
+    // Instruction to initialize the ExtraAccountMetaList account
     pub fn initialize_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
     ) -> Result<()> {
@@ -94,9 +107,7 @@ pub mod transfer_hook {
         Ok(())
     }
 
-
-    
-    #[instruction(discriminator = [2])]
+    // Instruction to update the ExtraAccountMetaList account
     pub fn update_extra_account_meta_list(
         ctx: Context<InitializeExtraAccountMetaList>,
     ) -> Result<()> {
@@ -112,7 +123,19 @@ pub mod transfer_hook {
         if lamports>ctx.accounts.extra_account_meta_list.lamports() {
 
             let lamport_diff = lamports-ctx.accounts.extra_account_meta_list.lamports();
-            ctx.accounts.extra_account_meta_list.resize(account_size as usize)?;
+            
+            // Reallocate the account to the new size.
+            ctx.accounts.extra_account_meta_list.realloc(account_size as usize, false)?;
+
+            // Transfer the required lamports for rent exemption.
+            let cpi_context = CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.extra_account_meta_list.to_account_info(),
+                },
+            );
+            system_program::transfer(cpi_context, lamport_diff)?;
 
             transfer(CpiContext::new(
                     ctx.accounts.system_program.to_account_info(),
@@ -136,9 +159,7 @@ pub mod transfer_hook {
         Ok(())
     }
     
-
-    
-    #[instruction(discriminator = [3])]
+    // Instruction to initialize the treasury PDA
     pub fn initialize_treasury(
         ctx: Context<InitializeTreasury>,
     ) -> Result<()> {
@@ -186,6 +207,37 @@ pub mod transfer_hook {
 
         Ok(())
     }
+
+    // Instruction to withdraw collected fees from the treasury
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        // Ensure the signer is the designated admin authority
+        if ctx.accounts.authority.key() != ADMIN_AUTHORITY {
+            return err!(MyError::Unauthorized);
+        }
+
+        let mint_key = ctx.accounts.wsol_mint.key();
+        let signer_seeds: &[&[&[u8]]] = &[&[
+            b"my-treasury",
+            mint_key.as_ref(),
+            &[ctx.bumps.treasury_pda],
+        ]];
+
+        msg!("Withdrawing {} from treasury", amount);
+
+        // Perform the CPI to transfer from the treasury PDA to the destination account
+        anchor_spl::token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                anchor_spl::token_interface::TransferChecked {
+                    from: ctx.accounts.treasury_pda.to_account_info(),
+                    to: ctx.accounts.destination_account.to_account_info(),
+                    authority: ctx.accounts.treasury_pda.to_account_info(),
+                    mint: ctx.accounts.wsol_mint.to_account_info(),
+                },
+                signer_seeds,
+            ), amount, ctx.accounts.wsol_mint.decimals)?;
+        Ok(())
+    }
 }
 
 
@@ -221,6 +273,29 @@ pub struct InitializeTreasury<'info> {
     pub treasury_pda: AccountInfo<'info>,
     pub mint: InterfaceAccount<'info, Mint>,
     pub system_program: Program<'info, System>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub wsol_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [b"my-treasury", wsol_mint.key().as_ref()],
+        bump
+    )]
+    pub treasury_pda: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        token::mint = wsol_mint
+    )]
+    pub destination_account: InterfaceAccount<'info, TokenAccount>,
+
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -276,7 +351,7 @@ pub struct TransferHook<'info> {
 
 fn get_extra_accounts() -> Result<Vec<ExtraAccountMeta>>{
     let wsol_mint = ExtraAccountMeta::new_with_pubkey(&native_mint::ID, false, false)?;
-    let token_program = ExtraAccountMeta::new_with_pubkey(&spl_token::ID, false, false)?;
+    let token_program = ExtraAccountMeta::new_with_pubkey(&anchor_spl::token::ID, false, false)?;
     let treasury_pda = ExtraAccountMeta::new_with_seeds(&[Seed::Literal{bytes:"my-treasury".as_bytes().to_vec()}, Seed::AccountKey { index: 5 }], false, true)?;
     let associated_token_program = ExtraAccountMeta::new_with_pubkey(&AssociatedToken::id(), false, false)?;
     let source_wsol_ata = ExtraAccountMeta::new_external_pda_with_seeds(8, &[Seed::AccountKey{index: 3}, Seed::AccountKey{index: 6}, Seed::AccountKey{index: 5}], false, true)?;
@@ -297,7 +372,7 @@ fn get_extra_accounts() -> Result<Vec<ExtraAccountMeta>>{
 fn assert_is_transferring(ctx: &Context<TransferHook>) -> Result<()> {
     let source_token_info = ctx.accounts.source_token.to_account_info();
     let mut account_data_ref: RefMut<&mut [u8]> = source_token_info.try_borrow_mut_data()?;
-    let mut account = PodStateWithExtensionsMut::<PodAccount>::unpack(*account_data_ref)?;
+    let mut account = StateWithExtensionsMut::<PodAccount>::unpack(*account_data_ref)?;
     let account_extension = account.get_extension_mut::<TransferHookAccount>()?;
 
     if !bool::from(account_extension.transferring) {
@@ -313,4 +388,6 @@ fn assert_is_transferring(ctx: &Context<TransferHook>) -> Result<()> {
 pub enum MyError {
     #[msg("Not currently transfering")]
     NotFromT22,
+    #[msg("Unauthorized to withdraw funds")]
+    Unauthorized,
 }
